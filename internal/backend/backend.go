@@ -13,6 +13,7 @@ import (
 	"runtime"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/charmbracelet/crush/internal/app"
@@ -20,6 +21,7 @@ import (
 	"github.com/charmbracelet/crush/internal/csync"
 	"github.com/charmbracelet/crush/internal/db"
 	"github.com/charmbracelet/crush/internal/proto"
+	"github.com/charmbracelet/crush/internal/shell"
 	"github.com/charmbracelet/crush/internal/skills"
 	"github.com/charmbracelet/crush/internal/ui/util"
 	"github.com/charmbracelet/crush/internal/version"
@@ -70,6 +72,11 @@ var DefaultIdleShutdownDelay = 60 * time.Second
 // that released its claim first (a clean exit) skips the grace. Overridable
 // via CRUSH_SERVER_DETACH_GRACE (seconds; 0 restores immediate teardown).
 var DefaultDetachGrace = 10 * time.Second
+
+// DefaultDetachedWorkPollInterval is how often a zero-client workspace kept
+// alive by live work (in-flight runs, background jobs) is re-checked for
+// work completion. Exposed as a package variable so tests can shorten it.
+var DefaultDetachedWorkPollInterval = 250 * time.Millisecond
 
 // ShutdownFunc is called when the backend needs to trigger a server
 // shutdown (e.g. when the last workspace is removed).
@@ -129,12 +136,13 @@ type Backend struct {
 	retired map[string]struct{}
 	mu      sync.Mutex
 
-	cfg         *config.ConfigStore
-	ctx         context.Context
-	shutdownFn  ShutdownFunc
-	createGrace time.Duration
-	lingerDelay time.Duration
-	detachGrace time.Duration
+	cfg              *config.ConfigStore
+	ctx              context.Context
+	shutdownFn       ShutdownFunc
+	createGrace      time.Duration
+	lingerDelay      time.Duration
+	detachGrace      time.Duration
+	workPollInterval time.Duration
 }
 
 // clientState tracks one client's claim on a workspace.
@@ -194,9 +202,14 @@ type Workspace struct {
 	// closing is set by Shutdown so no new runs are accepted once
 	// teardown has begun. runWG tracks dispatched agent goroutines
 	// so Shutdown can wait for them to return before app cleanup.
-	runMu   sync.Mutex
-	closing bool
-	runWG   sync.WaitGroup
+	// runsInFlight is the countable mirror of runWG: it lets teardown
+	// observe "an agent run is in flight" (including one blocked on a
+	// permission prompt) without waiting on the WaitGroup.
+	runMu         sync.Mutex
+	closing       bool
+	runWG         sync.WaitGroup
+	runsInFlight  atomic.Int64
+	workWatcherOn atomic.Bool
 
 	// clientsMu guards clients. It is held only briefly (no IO).
 	clientsMu sync.Mutex
@@ -315,6 +328,15 @@ func (b *Backend) SetIdleShutdownDelay(d time.Duration) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.lingerDelay = d
+}
+
+// SetDetachedWorkPollInterval overrides how often a zero-client workspace
+// kept alive by live work is re-checked for work completion. A value <= 0
+// falls back to DefaultDetachedWorkPollInterval. Intended for tests.
+func (b *Backend) SetDetachedWorkPollInterval(d time.Duration) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.workPollInterval = d
 }
 
 // GetWorkspace retrieves a workspace by ID.
@@ -798,6 +820,71 @@ func (b *Backend) detachStream(ws *Workspace, clientID string) {
 	}
 }
 
+// hasLiveWork reports whether the workspace has work that must keep it
+// alive after the last client detaches: an in-flight agent run (including
+// one blocked on a permission prompt) or a background job started by this
+// workspace that has not completed yet. Killing either just because every
+// client went away would make a disconnect destroy work the user asked
+// for, so teardown defers to this predicate.
+func (ws *Workspace) hasLiveWork() bool {
+	if ws.runsInFlight.Load() > 0 {
+		return true
+	}
+	if ws.Cfg == nil {
+		// Test workspaces may carry no config; they cannot own
+		// background jobs, so runs are their only live work.
+		return false
+	}
+	return shell.GetBackgroundShellManager().RunningCountForOwner(ws.Cfg.WorkingDir()) > 0
+}
+
+// watchDetachedWork polls a zero-client workspace that was kept alive by
+// live work and tears it down once that work ends and nobody has
+// re-claimed it. Runs at most once per workspace at a time; the
+// workWatcherOn latch prevents duplicate pollers when teardown declines
+// repeatedly (e.g. a run finishes while a background job is still going).
+func (b *Backend) watchDetachedWork(ws *Workspace) {
+	if !ws.workWatcherOn.CompareAndSwap(false, true) {
+		return
+	}
+	defer ws.workWatcherOn.Store(false)
+
+	b.mu.Lock()
+	interval := b.workPollInterval
+	b.mu.Unlock()
+	if interval <= 0 {
+		interval = DefaultDetachedWorkPollInterval
+	}
+	wsCtx := ws.ctx
+	if wsCtx == nil {
+		wsCtx = context.Background()
+	}
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-b.ctx.Done():
+			return
+		case <-wsCtx.Done():
+			return
+		case <-ticker.C:
+			ws.clientsMu.Lock()
+			clients := len(ws.clients)
+			ws.clientsMu.Unlock()
+			if clients > 0 {
+				// Re-claimed: normal claim-driven teardown owns the
+				// workspace's fate again.
+				return
+			}
+			if !ws.hasLiveWork() {
+				b.teardown(ws)
+				return
+			}
+		}
+	}
+}
+
 // teardown removes the workspace from the index, shuts down its
 // underlying [app.App], and triggers a server shutdown if it was the
 // last workspace alive.
@@ -809,6 +896,12 @@ func (b *Backend) detachStream(ws *Workspace, clientID string) {
 // so it is mutually exclusive with this critical section). teardown
 // re-checks under both locks (in the canonical b.mu -> ws.clientsMu
 // order) and aborts if the workspace has been re-claimed.
+//
+// A workspace with live work (in-flight runs, running background jobs)
+// is NOT torn down here even with zero clients: the run's lifetime is
+// owned by the workspace, not by any client. Instead a detached-work
+// watcher re-attempts teardown once the work ends and the workspace is
+// still unclaimed.
 func (b *Backend) teardown(ws *Workspace) {
 	b.mu.Lock()
 	ws.clientsMu.Lock()
@@ -818,6 +911,15 @@ func (b *Backend) teardown(ws *Workspace) {
 		// taking b.mu. Abort: the workspace is still alive.
 		ws.clientsMu.Unlock()
 		b.mu.Unlock()
+		return
+	}
+	if ws.hasLiveWork() {
+		// Every client is gone but work is still running. Keep the
+		// workspace registered (so a returning client reuses it) and
+		// watch for the work to end.
+		ws.clientsMu.Unlock()
+		b.mu.Unlock()
+		go b.watchDetachedWork(ws)
 		return
 	}
 	ws.clientsMu.Unlock()

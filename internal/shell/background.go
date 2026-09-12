@@ -50,6 +50,12 @@ type BackgroundShell struct {
 	Description string
 	Shell       *Shell
 	WorkingDir  string
+	// Owner tags the shell with the workspace that started it (the
+	// workspace's config working directory). It scopes liveness queries
+	// and teardown kills in server mode, where one process hosts many
+	// workspaces and a workspace shutdown must not kill another
+	// workspace's jobs. Empty means unowned (tests, legacy callers).
+	Owner       string
 	ctx         context.Context
 	cancel      context.CancelFunc
 	stdout      *syncBuffer
@@ -86,7 +92,15 @@ func GetBackgroundShellManager() *BackgroundShellManager {
 }
 
 // Start creates and starts a new background shell with the given command.
+// The shell is unowned; see StartForOwner.
 func (m *BackgroundShellManager) Start(ctx context.Context, workingDir string, blockFuncs []BlockFunc, command string, description string) (*BackgroundShell, error) {
+	return m.StartForOwner(ctx, workingDir, blockFuncs, command, description, "")
+}
+
+// StartForOwner creates and starts a new background shell attributed to
+// owner (typically a workspace's config working directory). Owner-scoped
+// queries and kills only consider shells whose Owner matches.
+func (m *BackgroundShellManager) StartForOwner(ctx context.Context, workingDir string, blockFuncs []BlockFunc, command string, description string, owner string) (*BackgroundShell, error) {
 	// Check job limit
 	if m.shells.Len() >= MaxBackgroundJobs {
 		return nil, fmt.Errorf("maximum number of background jobs (%d) reached. Please terminate or wait for some jobs to complete", MaxBackgroundJobs)
@@ -106,6 +120,7 @@ func (m *BackgroundShellManager) Start(ctx context.Context, workingDir string, b
 		Command:     command,
 		Description: description,
 		WorkingDir:  workingDir,
+		Owner:       owner,
 		Shell:       shell,
 		ctx:         shellCtx,
 		cancel:      cancel,
@@ -199,6 +214,49 @@ func (m *BackgroundShellManager) KillAll(ctx context.Context) {
 
 	var wg sync.WaitGroup
 	for _, shell := range shells {
+		wg.Go(func() {
+			shell.cancel()
+			select {
+			case <-shell.done:
+			case <-ctx.Done():
+			}
+		})
+	}
+	wg.Wait()
+}
+
+// RunningCountForOwner returns how many of the owner's background shells
+// have not completed yet. Unowned shells (empty Owner) are never counted.
+func (m *BackgroundShellManager) RunningCountForOwner(owner string) int {
+	if owner == "" {
+		return 0
+	}
+	running := 0
+	for shell := range m.shells.Seq() {
+		if shell.Owner == owner && shell.completedAt.Load() == 0 {
+			running++
+		}
+	}
+	return running
+}
+
+// KillAllForOwner terminates every background shell started by the given
+// owner, running or completed. Shells owned by other workspaces are left
+// alone; in server mode the manager is shared across workspaces and a
+// single workspace's shutdown must only reap its own jobs.
+func (m *BackgroundShellManager) KillAllForOwner(ctx context.Context, owner string) {
+	if owner == "" {
+		m.KillAll(ctx)
+		return
+	}
+	var wg sync.WaitGroup
+	for shell := range m.shells.Seq() {
+		if shell.Owner != owner {
+			continue
+		}
+		if !m.shells.CompareAndDelete(shell.ID, shell) {
+			continue
+		}
 		wg.Go(func() {
 			shell.cancel()
 			select {

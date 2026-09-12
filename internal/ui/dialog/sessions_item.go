@@ -106,7 +106,12 @@ func (s *SessionItem) Cursor() *tea.Cursor {
 }
 
 // InfoText returns the secondary text shown on the right of the item.
+// A session with an in-flight run is flagged as running so a picker can
+// offer a live attach; otherwise the usual relative timestamp is shown.
 func (s *SessionItem) InfoText() string {
+	if s.IsBusy {
+		return "running"
+	}
 	return humanize.Time(time.Unix(s.UpdatedAt, 0))
 }
 

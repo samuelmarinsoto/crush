@@ -848,9 +848,11 @@ func (app *App) Shutdown() {
 		event.AppExited()
 	})
 
-	// Kill all background shells.
+	// Kill this app's background shells. The manager is shared across
+	// workspaces in server mode, so only the shells this workspace
+	// started are reaped here.
 	wg.Go(func() {
-		shell.GetBackgroundShellManager().KillAll(shutdownCtx)
+		shell.GetBackgroundShellManager().KillAllForOwner(shutdownCtx, app.config.WorkingDir())
 	})
 
 	// Close herdr client to stop its background writer.

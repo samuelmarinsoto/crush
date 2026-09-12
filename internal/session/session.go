@@ -60,6 +60,10 @@ type Session struct {
 	Todos            []Todo
 	CreatedAt        int64
 	UpdatedAt        int64
+	// IsBusy reports whether an agent run is in flight for this
+	// session. Like proto.Session.IsBusy it is computed on read (never
+	// persisted) and lets pickers flag live sessions.
+	IsBusy bool
 }
 
 type Service interface {

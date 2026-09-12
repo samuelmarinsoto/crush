@@ -766,7 +766,10 @@ func resolveSessionByID(ctx context.Context, c *client.Client, wsID, id string) 
 	var matches []proto.Session
 	for _, s := range sessions {
 		hash := session.HashID(s.ID)
-		if hash == id || strings.HasPrefix(hash, id) {
+		// Accept the short hash crush session list prints, a raw UUID
+		// prefix (e.g. the session_id= value crush run logs), or the
+		// full UUID.
+		if hash == id || strings.HasPrefix(hash, id) || strings.HasPrefix(s.ID, id) {
 			matches = append(matches, s)
 		}
 	}

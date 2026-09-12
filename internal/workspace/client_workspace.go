@@ -1259,6 +1259,7 @@ func protoToSession(s proto.Session) session.Session {
 		Todos:            protoToTodos(s.Todos),
 		CreatedAt:        s.CreatedAt,
 		UpdatedAt:        s.UpdatedAt,
+		IsBusy:           s.IsBusy,
 	}
 }
 

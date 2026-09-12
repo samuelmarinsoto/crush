@@ -53,7 +53,18 @@ func (w *AppWorkspace) GetSession(ctx context.Context, sessionID string) (sessio
 }
 
 func (w *AppWorkspace) ListSessions(ctx context.Context) ([]session.Session, error) {
-	return w.app.Sessions.List(ctx)
+	sessions, err := w.app.Sessions.List(ctx)
+	if err != nil {
+		return nil, err
+	}
+	// Mirror the server's computed IsBusy so the session picker can
+	// flag live sessions in local mode too.
+	if w.app.AgentCoordinator != nil {
+		for i := range sessions {
+			sessions[i].IsBusy = w.app.AgentCoordinator.IsSessionBusy(sessions[i].ID)
+		}
+	}
+	return sessions, nil
 }
 
 func (w *AppWorkspace) SaveSession(ctx context.Context, sess session.Session) (session.Session, error) {

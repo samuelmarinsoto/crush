@@ -55,6 +55,7 @@ func (b *Backend) SendMessage(workspaceID string, msg proto.AgentMessage) error 
 		return ErrWorkspaceClosing
 	}
 	ws.runWG.Add(1)
+	ws.runsInFlight.Add(1)
 	ws.runMu.Unlock()
 
 	go b.runAgent(ws, msg, accept)
@@ -87,6 +88,7 @@ func (b *Backend) SendMessage(workspaceID string, msg proto.AgentMessage) error 
 // the terminal event, letting runAgent avoid a duplicate fallback.
 func (b *Backend) runAgent(ws *Workspace, msg proto.AgentMessage, accept *agent.AcceptedRun) {
 	defer ws.runWG.Done()
+	defer ws.runsInFlight.Add(-1)
 	defer accept.Close()
 
 	ctx := ws.ctx

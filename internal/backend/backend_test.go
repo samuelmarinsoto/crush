@@ -14,8 +14,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/charmbracelet/crush/internal/config"
 	"github.com/charmbracelet/crush/internal/csync"
 	"github.com/charmbracelet/crush/internal/proto"
+	"github.com/charmbracelet/crush/internal/shell"
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
 )
@@ -1359,6 +1361,110 @@ func TestTeardown_ShutsDownWhenIdleAndNoPending(t *testing.T) {
 
 	require.Equal(t, int32(1), serverShutdowns.Load(),
 		"server must shut down once the last workspace is gone and nothing is pending")
+}
+
+// TestTeardown_DeferredWhileRunInFlight is the core keep-alive guarantee:
+// with zero clients but an in-flight agent run, teardown must decline (the
+// workspace stays registered, nothing is shut down), and once the run ends
+// the detached-work watcher must tear the workspace — and then the server,
+// since it was the last one — down.
+func TestTeardown_DeferredWhileRunInFlight(t *testing.T) {
+	t.Parallel()
+
+	b, serverShutdowns := newTestBackend(t)
+	b.SetDetachedWorkPollInterval(10 * time.Millisecond)
+	ws, wsShutdowns := insertTestWorkspace(t, b, "/tmp/run-in-flight")
+
+	ws.runsInFlight.Add(1)
+	b.teardown(ws)
+
+	require.Equal(t, int32(0), serverShutdowns.Load(), "a workspace with an in-flight run must keep the server alive")
+	require.Equal(t, int32(0), wsShutdowns.Load(), "a workspace with an in-flight run must not be shut down")
+	_, stillRegistered := b.workspaces.Get(ws.ID)
+	require.True(t, stillRegistered, "the workspace must stay registered so a returning client reuses it")
+
+	ws.runsInFlight.Add(-1)
+
+	require.Eventually(t, func() bool {
+		return serverShutdowns.Load() == 1 && wsShutdowns.Load() == 1
+	}, 5*time.Second, 10*time.Millisecond, "watcher must tear the workspace down once the run ends")
+	_, stillRegistered = b.workspaces.Get(ws.ID)
+	require.False(t, stillRegistered, "workspace must be deregistered after the deferred teardown")
+}
+
+// TestTeardown_WatcherHonorsReclaim covers the race the watcher must lose:
+// teardown declines because a run is in flight, and before the run ends a
+// client re-claims the workspace (reattach). The watcher must stand down;
+// claim-driven teardown owns the workspace's fate again.
+func TestTeardown_WatcherHonorsReclaim(t *testing.T) {
+	t.Parallel()
+
+	b, serverShutdowns := newTestBackend(t)
+	b.SetDetachedWorkPollInterval(10 * time.Millisecond)
+	ws, wsShutdowns := insertTestWorkspace(t, b, "/tmp/watcher-reclaim")
+
+	ws.runsInFlight.Add(1)
+	b.teardown(ws) // declines, arms the watcher
+
+	// Simulate a client reattaching: CreateWorkspace's fast path
+	// registers the client, and its SSE stream attaches (which stops
+	// the create-grace hold timer) — the same two steps a returning
+	// thin client takes.
+	clientID := uuid.New().String()
+	b.mu.Lock()
+	b.registerClient(ws, clientID)
+	b.mu.Unlock()
+	require.NoError(t, b.AttachClient(ws.ID, clientID))
+
+	ws.runsInFlight.Add(-1)
+
+	// The watcher must observe the claim and exit without tearing
+	// anything down.
+	time.Sleep(100 * time.Millisecond)
+	require.Equal(t, int32(0), wsShutdowns.Load(), "a re-claimed workspace must not be torn down by the detached-work watcher")
+	require.Equal(t, int32(0), serverShutdowns.Load(), "server must stay up while the workspace is claimed")
+	_, stillRegistered := b.workspaces.Get(ws.ID)
+	require.True(t, stillRegistered, "re-claimed workspace must stay registered")
+
+	// Cleanup: drop the stream claim so the workspace tears down.
+	b.DetachClient(ws.ID, clientID)
+}
+
+// TestTeardown_DeferredWhileBgJobRunning covers the second live-work
+// source: a background job owned by the workspace (tagged with the
+// workspace's config working directory). The workspace survives the last
+// client while the job runs and is torn down once the job is killed.
+func TestTeardown_DeferredWhileBgJobRunning(t *testing.T) {
+	// Not parallel: uses the process-global background shell manager.
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("XDG_DATA_HOME", t.TempDir())
+
+	b, serverShutdowns := newTestBackend(t)
+	b.SetDetachedWorkPollInterval(10 * time.Millisecond)
+
+	dir := t.TempDir()
+	cfg, err := config.Init(dir, t.TempDir(), false)
+	require.NoError(t, err)
+
+	ws, wsShutdowns := insertTestWorkspace(t, b, dir)
+	ws.Cfg = cfg
+
+	mgr := shell.GetBackgroundShellManager()
+	job, err := mgr.StartForOwner(context.Background(), dir, nil, "sleep 30", "", cfg.WorkingDir())
+	require.NoError(t, err)
+	t.Cleanup(func() { mgr.KillAllForOwner(context.Background(), cfg.WorkingDir()) })
+
+	b.teardown(ws)
+	require.Equal(t, int32(0), wsShutdowns.Load(), "a workspace with a running background job must not be shut down")
+	require.Equal(t, int32(0), serverShutdowns.Load(), "a running background job must keep the server alive")
+
+	require.NoError(t, mgr.Kill(job.ID))
+
+	require.Eventually(t, func() bool {
+		return wsShutdowns.Load() == 1 && serverShutdowns.Load() == 1
+	}, 5*time.Second, 10*time.Millisecond, "watcher must tear the workspace down once its background job ends")
 }
 
 // TestCreateWorkspace_PendingBalancedOnSuccess drives the real

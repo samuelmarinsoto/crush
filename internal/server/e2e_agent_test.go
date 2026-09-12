@@ -617,6 +617,70 @@ func TestE2E_AgentRunSurvivesAcrossWorkspaceClaims(t *testing.T) {
 	require.Equal(t, sid, got.Payload.SessionID)
 }
 
+// TestE2E_AgentRunSurvivesLastClientDetach is the keep-alive guarantee:
+// a run must survive the LAST client detaching. The workspace stays
+// registered (so a returning client reuses it), a client that comes back
+// mid-run observes the finish live, and once both the run and every
+// client are gone the workspace is torn down as before.
+func TestE2E_AgentRunSurvivesLastClientDetach(t *testing.T) {
+	t.Parallel()
+	h := newAgentE2EHarness(t)
+	h.backend.SetDetachGrace(100 * time.Millisecond)
+	h.backend.SetDetachedWorkPollInterval(20 * time.Millisecond)
+
+	ctxA, cancelA := context.WithCancel(t.Context())
+	ctxB, cancelB := context.WithCancel(t.Context())
+	t.Cleanup(cancelB)
+
+	const sid = "s-survive-last"
+
+	// Client A starts a run and leaves before it finishes.
+	cidA := uuid.New().String()
+	_, killA := h.subscribeSSE(t, ctxA, h.workspace.ID, cidA)
+	h.waitForAttached(t, 1)
+	require.Equal(t, http.StatusAccepted, h.postAgentHTTP(t, ctxA, sid))
+	h.waitForRunEntered(t)
+	cancelA()
+	killA()
+	require.Eventually(t, func() bool {
+		return backend.WorkspaceLiveStreamCountForTest(h.workspace) == 0
+	}, 3*time.Second, 10*time.Millisecond, "A must fully detach")
+
+	// Past the detach grace, with zero clients, the run keeps the
+	// workspace alive and registered.
+	time.Sleep(300 * time.Millisecond)
+	_, err := h.backend.GetWorkspace(h.workspace.ID)
+	require.NoError(t, err, "workspace must stay registered while its run is in flight")
+
+	// A fresh client attaches mid-run and watches the finish live.
+	evcB, killB := h.subscribeSSE(t, ctxB, h.workspace.ID, uuid.New().String())
+	t.Cleanup(killB)
+	h.waitForAttached(t, 1)
+
+	close(h.coord.release)
+	pickCtx, pickCancel := context.WithTimeout(ctxB, 3*time.Second)
+	defer pickCancel()
+	got, ok := drainUntil(pickCtx, evcB, func(e pubsub.Event[proto.Message]) bool {
+		r, has := finishReason(e.Payload)
+		return e.Payload.Role == proto.Assistant && has && r == proto.FinishReasonEndTurn
+	})
+	require.True(t, ok, "the reattaching client must observe the run finish live")
+	require.Equal(t, sid, got.Payload.SessionID)
+
+	// The run is over but B is attached: the workspace stays.
+	time.Sleep(300 * time.Millisecond)
+	_, err = h.backend.GetWorkspace(h.workspace.ID)
+	require.NoError(t, err, "an attached client must keep the workspace alive after the run ends")
+
+	// Once B leaves too, the idle workspace is torn down as before.
+	cancelB()
+	killB()
+	require.Eventually(t, func() bool {
+		_, err := h.backend.GetWorkspace(h.workspace.ID)
+		return err != nil
+	}, 3*time.Second, 20*time.Millisecond, "the idle workspace must be torn down after the last client leaves")
+}
+
 // TestE2E_CancelOfActiveRunAlsoCancelsAcceptedFollowUp covers PLAN item
 // 1c at the externally-observable level: while session sid has an active
 // run, a second prompt for sid is accepted; a cancel for sid must cancel
