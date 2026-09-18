@@ -133,13 +133,14 @@ func newTailStream(cmd *cobra.Command, sessionID string) (*tailStream, error) {
 		return nil, err
 	}
 	return &tailStream{
-		sessionID: sessionID,
-		out:       os.Stdout,
-		opts:      opts,
-		read:      make(map[string]int),
-		thinkRead: make(map[string]int),
-		seenCalls: make(map[string]bool),
-		finished:  make(map[string]bool),
+		sessionID:   sessionID,
+		out:         os.Stdout,
+		opts:        opts,
+		read:        make(map[string]int),
+		thinkRead:   make(map[string]int),
+		seenCalls:   make(map[string]bool),
+		seenResults: make(map[string]bool),
+		finished:    make(map[string]bool),
 	}, nil
 }
 
@@ -327,8 +328,10 @@ type tailStream struct {
 	read      map[string]int
 	thinkRead map[string]int
 	// seenCalls deduplicates tool-call parts, which stream repeatedly
-	// as the same message grows.
-	seenCalls map[string]bool
+	// as the same message grows. seenResults does the same for tool
+	// result messages, which local polling rediscovers every sample.
+	seenCalls   map[string]bool
+	seenResults map[string]bool
 	// finished tracks assistant turns already closed in local polling
 	// mode, where finish markers are rediscovered on every sample.
 	finished map[string]bool
@@ -371,9 +374,16 @@ func (s *tailStream) handle(ev any) error {
 				return nil
 			}
 			for _, part := range msg.Parts {
-				if res, ok := part.(proto.ToolResult); ok {
-					s.emitToolResult(res)
+				res, ok := part.(proto.ToolResult)
+				if !ok {
+					continue
 				}
+				key := msg.ID + "/" + res.ToolCallID
+				if s.seenResults[key] {
+					continue
+				}
+				s.seenResults[key] = true
+				s.emitToolResult(res)
 			}
 		}
 		return nil

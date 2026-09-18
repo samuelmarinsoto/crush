@@ -14,12 +14,13 @@ import (
 func newTestTailStream(opts tailOpts) (*tailStream, *bytes.Buffer) {
 	buf := &bytes.Buffer{}
 	return &tailStream{
-		sessionID: "S",
-		out:       buf,
-		opts:      opts,
-		read:      make(map[string]int),
-		thinkRead: make(map[string]int),
-		seenCalls: make(map[string]bool),
+		sessionID:   "S",
+		out:         buf,
+		opts:        opts,
+		read:        make(map[string]int),
+		thinkRead:   make(map[string]int),
+		seenCalls:   make(map[string]bool),
+		seenResults: make(map[string]bool),
 	}, buf
 }
 
@@ -191,4 +192,23 @@ func TestTailStream_SessionFilter(t *testing.T) {
 	require.NoError(t, s.handle(other))
 	require.NoError(t, s.handle(pubsub.Event[proto.RunComplete]{Payload: proto.RunComplete{SessionID: "other"}}))
 	require.Empty(t, buf.String())
+}
+
+// TestTailStream_ToolResultDeduplicatedOnResample is the local-polling
+// regression test: poll samples re-feed every persisted message each
+// tick, and a tool result message must print exactly once no matter
+// how many samples rediscover it.
+func TestTailStream_ToolResultDeduplicatedOnResample(t *testing.T) {
+	t.Parallel()
+
+	s, buf := newTestTailStream(tailOpts{tools: true})
+
+	result := pubsub.Event[proto.Message]{Payload: proto.Message{
+		ID: "t1", SessionID: "S", Role: proto.Tool,
+		Parts: []proto.ContentPart{proto.ToolResult{ToolCallID: "c1", Name: "bash", Content: "ok"}},
+	}}
+	for range 5 {
+		require.NoError(t, s.handle(result))
+	}
+	require.Equal(t, "* bash (ok)\n", buf.String())
 }
