@@ -529,6 +529,9 @@ func (s *tailStream) writeThinkingLine(line string) {
 }
 
 func (s *tailStream) emitToolCall(call proto.ToolCall) {
+	if s.quiet {
+		return
+	}
 	if s.opts.json {
 		s.emit(tailJSON{
 			Type:    "tool_call",
@@ -545,6 +548,9 @@ func (s *tailStream) emitToolCall(call proto.ToolCall) {
 }
 
 func (s *tailStream) emitToolResult(res proto.ToolResult) {
+	if s.quiet {
+		return
+	}
 	if s.opts.json {
 		s.emit(tailJSON{
 			Type:    "tool_result",
