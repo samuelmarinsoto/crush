@@ -60,6 +60,12 @@ type App struct {
 	Questions   question.Service
 	FileTracker filetracker.Service
 
+	agentInitMu sync.Mutex
+	// AgentCoordinator runs the workspace's agent sessions. It is set
+	// once by initCoderAgent and never replaced while the app lives:
+	// in-flight runs are bound to the instance they started on, so a
+	// re-init would orphan them (cancels and queued prompts would land
+	// on the new instance while the old one kept executing).
 	AgentCoordinator agent.Coordinator
 
 	LSPManager *lsp.Manager
@@ -756,6 +762,18 @@ func (app *App) InitCoderAgentNonInteractive(ctx context.Context) error {
 }
 
 func (app *App) initCoderAgent(ctx context.Context, interactive bool) error {
+	// Idempotent by contract: every client connect runs init, and with
+	// keep-alive a reattaching client finds a workspace whose in-flight
+	// runs are bound to the existing coordinator. Rebuilding it here
+	// would orphan those runs — the new instance would answer cancels
+	// and queue prompts while the old one kept executing. Model
+	// changes go through UpdateModels on the live instance instead.
+	app.agentInitMu.Lock()
+	defer app.agentInitMu.Unlock()
+	if app.AgentCoordinator != nil {
+		return nil
+	}
+
 	coderAgentCfg := app.config.Config().Agents[config.AgentCoder]
 	if coderAgentCfg.ID == "" {
 		return fmt.Errorf("coder agent configuration is missing")
