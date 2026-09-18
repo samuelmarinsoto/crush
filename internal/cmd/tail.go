@@ -9,8 +9,10 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"time"
 
 	"github.com/charmbracelet/crush/internal/event"
+	"github.com/charmbracelet/crush/internal/message"
 	"github.com/charmbracelet/crush/internal/proto"
 	"github.com/charmbracelet/crush/internal/pubsub"
 	"github.com/spf13/cobra"
@@ -60,7 +62,7 @@ crush tail --json --tools --thinking 1c0f3eab
 	Args: cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		if !useClientServer() {
-			return fmt.Errorf("crush tail requires client/server mode: set CRUSH_CLIENT_SERVER=1")
+			return runTailLocal(cmd, args[0])
 		}
 
 		// Cancel on SIGINT or SIGTERM: stopping the tail stops the
@@ -88,14 +90,8 @@ crush tail --json --tools --thinking 1c0f3eab
 
 		fmt.Fprintf(os.Stderr, "Tailing session %s (Ctrl-C to stop)\n", sess.ID)
 
-		stream := &tailStream{
-			sessionID: sess.ID,
-			out:       os.Stdout,
-			read:      make(map[string]int),
-			thinkRead: make(map[string]int),
-			seenCalls: make(map[string]bool),
-		}
-		if stream.opts, err = readTailOpts(cmd); err != nil {
+		stream, err := newTailStream(cmd, sess.ID)
+		if err != nil {
 			return err
 		}
 
@@ -129,6 +125,156 @@ func init() {
 	tailCmd.Flags().Bool("tools", false, "Also print tool calls and results as one-line summaries")
 	tailCmd.Flags().Bool("thinking", false, "Also print reasoning/thinking deltas, lines prefixed with \"# \"")
 	tailCmd.Flags().Bool("json", false, "Emit machine-readable NDJSON events instead of text")
+}
+
+func newTailStream(cmd *cobra.Command, sessionID string) (*tailStream, error) {
+	opts, err := readTailOpts(cmd)
+	if err != nil {
+		return nil, err
+	}
+	return &tailStream{
+		sessionID: sessionID,
+		out:       os.Stdout,
+		opts:      opts,
+		read:      make(map[string]int),
+		thinkRead: make(map[string]int),
+		seenCalls: make(map[string]bool),
+		finished:  make(map[string]bool),
+	}, nil
+}
+
+// runTailLocal follows a session of a locally running crush process.
+// A local process exposes no event stream across process boundaries, so
+// tail polls the session's persisted messages and feeds the same
+// renderer the client/server path uses: identical output and flags,
+// at roughly one second of granularity. Turn boundaries are detected
+// from persisted finish markers instead of RunComplete events.
+func runTailLocal(cmd *cobra.Command, id string) error {
+	// Cancel on SIGINT or SIGTERM: stopping the tail stops the watch,
+	// never whatever the local process is doing.
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, os.Kill)
+	defer cancel()
+
+	event.SetNonInteractive(true)
+
+	_, svc, cleanup, err := sessionSetup(cmd)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+
+	sess, err := resolveSessionID(ctx, svc.sessions, id)
+	if err != nil {
+		return err
+	}
+
+	fmt.Fprintf(os.Stderr, "Tailing session %s (Ctrl-C to stop)\n", sess.ID)
+
+	stream, err := newTailStream(cmd, sess.ID)
+	if err != nil {
+		return err
+	}
+	seeded := false
+
+	sample := func() error {
+		msgs, err := svc.messages.ListMessages(ctx, sess.ID)
+		if err != nil {
+			if ctx.Err() != nil {
+				return nil
+			}
+			return err
+		}
+		// First sample catches up silently except for the newest
+		// assistant message, so attaching prints the last answer (or
+		// the in-flight tail) without replaying the whole session.
+		lastAssistant := -1
+		if !seeded {
+			for i, m := range msgs {
+				if m.Role == message.Assistant {
+					lastAssistant = i
+				}
+			}
+		}
+		for i, m := range msgs {
+			stream.quiet = !seeded && i != lastAssistant
+			pm := localMessageToProto(m)
+			if err := stream.handle(pubsub.Event[proto.Message]{Payload: pm}); err != nil {
+				return err
+			}
+			if pm.Role == proto.Assistant && messageFinished(pm) && !stream.finished[pm.ID] {
+				stream.finished[pm.ID] = true
+				if !stream.quiet {
+					if msg := finishErrorMessage(pm); msg != "" {
+						stream.reportError(msg)
+					}
+					stream.endTurn()
+				}
+			}
+		}
+		stream.quiet = false
+		seeded = true
+		return nil
+	}
+
+	// Sample immediately so tailing an already-finished session prints
+	// its final text instead of waiting for the first tick.
+	if err := sample(); err != nil {
+		return err
+	}
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-ticker.C:
+			if err := sample(); err != nil {
+				return err
+			}
+		}
+	}
+}
+
+// localMessageToProto converts a locally persisted message into the
+// wire shape tailStream renders. Only the parts tail consumes are
+// carried over.
+func localMessageToProto(m message.Message) proto.Message {
+	pm := proto.Message{
+		ID:        m.ID,
+		SessionID: m.SessionID,
+		Role:      proto.MessageRole(m.Role),
+	}
+	for _, p := range m.Parts {
+		switch v := p.(type) {
+		case message.TextContent:
+			pm.Parts = append(pm.Parts, proto.TextContent{Text: v.Text})
+		case message.ReasoningContent:
+			pm.Parts = append(pm.Parts, proto.ReasoningContent{Thinking: v.Thinking})
+		case message.ToolCall:
+			pm.Parts = append(pm.Parts, proto.ToolCall{ID: v.ID, Name: v.Name, Input: v.Input, Finished: v.Finished})
+		case message.ToolResult:
+			pm.Parts = append(pm.Parts, proto.ToolResult{
+				ToolCallID: v.ToolCallID,
+				Name:       v.Name,
+				Content:    v.Content,
+				IsError:    v.IsError,
+			})
+		case message.Finish:
+			pm.Parts = append(pm.Parts, proto.Finish{Reason: proto.FinishReason(v.Reason), Time: v.Time, Message: v.Message})
+		}
+	}
+	return pm
+}
+
+// messageFinished reports whether an assistant message carries a
+// finish marker, i.e. its turn has ended.
+func messageFinished(pm proto.Message) bool {
+	for _, p := range pm.Parts {
+		if _, ok := p.(proto.Finish); ok {
+			return true
+		}
+	}
+	return false
 }
 
 type tailOpts struct {
@@ -183,6 +329,12 @@ type tailStream struct {
 	// seenCalls deduplicates tool-call parts, which stream repeatedly
 	// as the same message grows.
 	seenCalls map[string]bool
+	// finished tracks assistant turns already closed in local polling
+	// mode, where finish markers are rediscovered on every sample.
+	finished map[string]bool
+	// quiet suppresses output while trackers advance during the local
+	// catch-up sample, so attaching prints only the newest message.
+	quiet bool
 	// printed suppresses output until the first non-blank content of a
 	// turn; midLine tracks whether a line is open (no trailing newline
 	// yet) so tool/thinking lines can start on fresh lines.
@@ -242,19 +394,11 @@ func (s *tailStream) handle(ev any) error {
 			s.flushThinking()
 		}
 		if e.Payload.Error != "" && !e.Payload.Cancelled {
-			if s.opts.json {
-				s.emit(tailJSON{Type: "run_complete", Error: e.Payload.Error})
-			} else {
-				fmt.Fprintf(os.Stderr, "run error: %s\n", e.Payload.Error)
-			}
+			s.reportError(e.Payload.Error)
 		} else if s.opts.json {
 			s.emit(tailJSON{Type: "run_complete", Cancelled: e.Payload.Cancelled})
 		}
-		if s.midLine {
-			fmt.Fprintln(s.out)
-			s.midLine = false
-		}
-		s.printed = false
+		s.endTurn()
 		return nil
 
 	case pubsub.Event[proto.AgentEvent]:
@@ -264,6 +408,29 @@ func (s *tailStream) handle(ev any) error {
 		return nil
 	}
 	return nil
+}
+
+// reportError surfaces a failed turn: stderr in text mode, a
+// run_complete object in JSON mode.
+func (s *tailStream) reportError(msg string) {
+	if s.opts.json {
+		s.emit(tailJSON{Type: "run_complete", Error: msg})
+		return
+	}
+	fmt.Fprintf(os.Stderr, "run error: %s\n", msg)
+}
+
+// endTurn closes a finished turn: flush buffered thinking, print the
+// turn separator, and reset per-turn output state.
+func (s *tailStream) endTurn() {
+	if s.opts.thinking {
+		s.flushThinking()
+	}
+	if s.midLine {
+		fmt.Fprintln(s.out)
+		s.midLine = false
+	}
+	s.printed = false
 }
 
 // printDelta prints the not-yet-read suffix of a streaming assistant
@@ -279,9 +446,11 @@ func (s *tailStream) printDelta(messageID, content string) {
 	if readBytes == 0 {
 		part = strings.TrimLeft(part, " \t")
 	}
-	if s.printed || strings.TrimSpace(part) != "" {
-		s.printed = true
-		s.writeText(part)
+	if !s.quiet {
+		if s.printed || strings.TrimSpace(part) != "" {
+			s.printed = true
+			s.writeText(part)
+		}
 	}
 	s.read[messageID] = len(content)
 }
@@ -289,6 +458,9 @@ func (s *tailStream) printDelta(messageID, content string) {
 // writeText emits an assistant text chunk, in JSON mode as a delta
 // object.
 func (s *tailStream) writeText(part string) {
+	if s.quiet {
+		return
+	}
 	if s.opts.json {
 		s.emit(tailJSON{Type: "text", Delta: part})
 		return
@@ -444,4 +616,15 @@ func truncateRunes(s string, max int) string {
 		return s
 	}
 	return string(runes[:max]) + "…"
+}
+
+// finishErrorMessage extracts the human-readable failure from a
+// finish marker, if any (e.g. "Too Many Requests" on an errored turn).
+func finishErrorMessage(pm proto.Message) string {
+	for _, p := range pm.Parts {
+		if fin, ok := p.(proto.Finish); ok {
+			return fin.Message
+		}
+	}
+	return ""
 }
