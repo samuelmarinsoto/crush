@@ -681,6 +681,64 @@ func TestE2E_AgentRunSurvivesLastClientDetach(t *testing.T) {
 	}, 3*time.Second, 20*time.Millisecond, "the idle workspace must be torn down after the last client leaves")
 }
 
+// TestE2E_AgentRunSurvivesClientRetire covers the GRACEFUL exit path:
+// a clean client exit retires the client (DELETE /v1/clients/{id}),
+// which releases its claims immediately — no detach grace. The run
+// must still keep the workspace alive past that, and a reattaching
+// client must observe the finish live.
+func TestE2E_AgentRunSurvivesClientRetire(t *testing.T) {
+	t.Parallel()
+	h := newAgentE2EHarness(t)
+	h.backend.SetDetachedWorkPollInterval(20 * time.Millisecond)
+
+	ctxA, cancelA := context.WithCancel(t.Context())
+	ctxB, cancelB := context.WithCancel(t.Context())
+	t.Cleanup(cancelB)
+
+	const sid = "s-survive-retire"
+
+	cidA := uuid.New().String()
+	_, killA := h.subscribeSSE(t, ctxA, h.workspace.ID, cidA)
+	h.waitForAttached(t, 1)
+	require.Equal(t, http.StatusAccepted, h.postAgentHTTP(t, ctxA, sid))
+	h.waitForRunEntered(t)
+
+	// A quits cleanly: retirement, not an SSE drop.
+	req, err := http.NewRequestWithContext(ctxA, http.MethodDelete,
+		h.httpSrv.URL+"/v1/clients/"+cidA, nil)
+	require.NoError(t, err)
+	resp, err := h.httpSrv.Client().Do(req)
+	require.NoError(t, err)
+	_, _ = io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	killA()
+	cancelA()
+
+	require.Eventually(t, func() bool {
+		return backend.WorkspaceLiveStreamCountForTest(h.workspace) == 0
+	}, 3*time.Second, 10*time.Millisecond, "retirement must release A's claim")
+
+	// The workspace survives the clean exit while the run is live.
+	_, err = h.backend.GetWorkspace(h.workspace.ID)
+	require.NoError(t, err, "workspace must stay registered after client retirement with a run in flight")
+
+	// A fresh client attaches mid-run and watches the finish live.
+	evcB, killB := h.subscribeSSE(t, ctxB, h.workspace.ID, uuid.New().String())
+	t.Cleanup(killB)
+	h.waitForAttached(t, 1)
+
+	close(h.coord.release)
+	pickCtx, pickCancel := context.WithTimeout(ctxB, 3*time.Second)
+	defer pickCancel()
+	got, ok := drainUntil(pickCtx, evcB, func(e pubsub.Event[proto.Message]) bool {
+		r, has := finishReason(e.Payload)
+		return e.Payload.Role == proto.Assistant && has && r == proto.FinishReasonEndTurn
+	})
+	require.True(t, ok, "the reattaching client must observe the run finish live")
+	require.Equal(t, sid, got.Payload.SessionID)
+}
+
 // TestE2E_CancelOfActiveRunAlsoCancelsAcceptedFollowUp covers PLAN item
 // 1c at the externally-observable level: while session sid has an active
 // run, a second prompt for sid is accepted; a cancel for sid must cancel
